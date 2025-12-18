@@ -1,0 +1,8 @@
+.flatpak
+.vscode
+_build
+builddir
+build
+*.log
+*.tmp
+*.bak
