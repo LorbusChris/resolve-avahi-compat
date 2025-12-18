@@ -68,6 +68,10 @@ static void ga_service_browser_init(GaServiceBrowser *obj) {
 
 static void ga_service_browser_dispose(GObject *object);
 static void ga_service_browser_finalize(GObject *object);
+static void disconnect_from_resolved(GaServiceBrowser *browser);
+gboolean ga_service_browser_attach(GaServiceBrowser *browser,
+                                   GaClient *client,
+                                   GError **error);
 
 static void ga_service_browser_set_property(GObject *object,
                                             guint property_id,
@@ -239,7 +243,6 @@ static void disconnect_from_resolved(GaServiceBrowser *browser) {
 
     if (priv->varlink_source) {
         g_source_destroy(priv->varlink_source);
-        g_source_unref(priv->varlink_source);
         priv->varlink_source = NULL;
     }
 
@@ -290,7 +293,32 @@ static int browse_notify_cb(G_GNUC_UNUSED sd_varlink *link,
     GaServiceBrowser *browser = GA_SERVICE_BROWSER(userdata);
     GaServiceBrowserPrivate *priv = GA_SERVICE_BROWSER_GET_PRIVATE(browser);
 
+    g_debug("GaServiceBrowser: browse_notify_cb called, error_id=%s",
+            error_id ? error_id : "(none)");
+
     if (error_id) {
+        /* If the subscription timed out or disconnected, try to reconnect.
+         * systemd-resolved BrowseServices has a default timeout. */
+        if (g_strcmp0(error_id, "io.systemd.TimedOut") == 0 ||
+            g_strcmp0(error_id, "io.systemd.Disconnected") == 0) {
+            g_debug("GaServiceBrowser: Subscription ended (%s), attempting reconnect", error_id);
+            /* Disconnect and reconnect */
+            disconnect_from_resolved(browser);
+            GError *reconnect_error = NULL;
+            if (!ga_service_browser_attach(browser, priv->client, &reconnect_error)) {
+                g_warning("GaServiceBrowser: Failed to reconnect: %s",
+                          reconnect_error ? reconnect_error->message : "unknown");
+                GError *error = g_error_new(GA_ERROR, GA_ERROR_FAILURE,
+                                            "Reconnection failed: %s", error_id);
+                g_signal_emit(browser, signals[FAILURE], 0, error);
+                g_error_free(error);
+                g_clear_error(&reconnect_error);
+            } else {
+                g_debug("GaServiceBrowser: Successfully reconnected after %s", error_id);
+            }
+            return 0;
+        }
+
         GError *error = g_error_new(GA_ERROR, GA_ERROR_FAILURE,
                                     "Browse error: %s", error_id);
         g_signal_emit(browser, signals[FAILURE], 0, error);
@@ -299,10 +327,13 @@ static int browse_notify_cb(G_GNUC_UNUSED sd_varlink *link,
     }
 
     sd_json_variant *array = sd_json_variant_by_key(parameters, "browserServiceData");
-    if (!array || !sd_json_variant_is_array(array))
+    if (!array || !sd_json_variant_is_array(array)) {
+        g_debug("GaServiceBrowser: No browserServiceData array in notification");
         return 0;
+    }
 
     size_t n = sd_json_variant_elements(array);
+    g_debug("GaServiceBrowser: Processing %zu service entries", n);
 
     for (size_t i = 0; i < n; i++) {
         sd_json_variant *entry = sd_json_variant_by_index(array, i);
@@ -326,13 +357,21 @@ static int browse_notify_cb(G_GNUC_UNUSED sd_varlink *link,
         int64_t ifindex = (ifindex_v && sd_json_variant_is_integer(ifindex_v))
                           ? sd_json_variant_integer(ifindex_v) : 0;
 
+        g_debug("GaServiceBrowser: Entry[%zu]: flag=%s name=%s type=%s domain=%s ifindex=%"G_GINT64_FORMAT,
+                i, update_flag ? update_flag : "(null)",
+                name ? name : "(null)", type ? type : "(null)",
+                domain ? domain : "(null)", (gint64)ifindex);
+
         /* Filter by type if specified */
-        if (priv->type && type && g_strcmp0(priv->type, type) != 0)
+        if (priv->type && type && g_strcmp0(priv->type, type) != 0) {
+            g_debug("GaServiceBrowser: Skipping, type mismatch (want=%s)", priv->type);
             continue;
+        }
 
         GaLookupResultFlags result_flags = GA_LOOKUP_RESULT_MULTICAST;
 
         if (g_strcmp0(update_flag, "added") == 0) {
+            g_debug("GaServiceBrowser: Emitting new-service for '%s'", name ? name : "(null)");
             priv->initial_snapshot_done = TRUE;
             g_signal_emit(browser, signals[NEW_SERVICE], 0,
                           (gint)ifindex,
@@ -342,6 +381,7 @@ static int browse_notify_cb(G_GNUC_UNUSED sd_varlink *link,
                           domain,
                           result_flags);
         } else if (g_strcmp0(update_flag, "removed") == 0) {
+            g_debug("GaServiceBrowser: Emitting removed-service for '%s'", name ? name : "(null)");
             g_signal_emit(browser, signals[REMOVED_SERVICE], 0,
                           (gint)ifindex,
                           priv->protocol,
@@ -349,6 +389,8 @@ static int browse_notify_cb(G_GNUC_UNUSED sd_varlink *link,
                           type,
                           domain,
                           result_flags);
+        } else {
+            g_debug("GaServiceBrowser: Unknown update_flag '%s'", update_flag ? update_flag : "(null)");
         }
     }
 
@@ -362,7 +404,10 @@ static gboolean varlink_io_cb(G_GNUC_UNUSED GIOChannel *source,
     GaServiceBrowser *browser = GA_SERVICE_BROWSER(user_data);
     GaServiceBrowserPrivate *priv = GA_SERVICE_BROWSER_GET_PRIVATE(browser);
 
+    g_debug("GaServiceBrowser: varlink_io_cb triggered, condition=0x%x", condition);
+
     if (condition & (G_IO_HUP | G_IO_ERR)) {
+        g_debug("GaServiceBrowser: Connection lost (HUP or ERR)");
         GError *error = g_error_new(GA_ERROR, GA_ERROR_DISCONNECTED,
                                     "Connection to systemd-resolved lost");
         g_signal_emit(browser, signals[FAILURE], 0, error);
@@ -375,6 +420,7 @@ static gboolean varlink_io_cb(G_GNUC_UNUSED GIOChannel *source,
         ;
 
     if (r < 0) {
+        g_debug("GaServiceBrowser: varlink processing error: %s", g_strerror(-r));
         GError *error = g_error_new(GA_ERROR, GA_ERROR_FAILURE,
                                     "Varlink processing error: %s",
                                     g_strerror(-r));
