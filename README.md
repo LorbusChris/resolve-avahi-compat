@@ -6,6 +6,8 @@ A drop-in replacement library for `avahi-gobject` that uses `systemd-resolved` i
 
 This library provides the same GObject-based API as `avahi-gobject` but communicates with `systemd-resolved` via its Varlink interface instead of requiring the Avahi daemon.
 
+> **⚠️ Important:** This library requires [systemd#40133](https://github.com/systemd/systemd/pull/40133), which is not yet merged. You will need a patched version of systemd until this PR is included in a release.
+
 ## Features
 
 ### Supported (via systemd-resolved)
@@ -41,6 +43,7 @@ Service publishing is implemented by writing `.dnssd` configuration files to `/r
 
 - GLib 2.56+
 - systemd 259+ (for Varlink API with `BrowseServices` ifindex=0 support)
+  - **Note:** Requires [systemd#40133](https://github.com/systemd/systemd/pull/40133)
 - `libsystemd` development headers
 
 ## Building
